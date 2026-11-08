@@ -46,11 +46,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Packaged converter failed' }
           python -c "from pathlib import Path; from tests.fixtures import soundfont; assert Path('packaged.sf2').read_bytes() == soundfont()"
           $process = Start-Process -FilePath 'dist/XSF-to-SF2.exe' -PassThru
-          Start-Sleep -Seconds 10
-          $process.Refresh()
-          if ($process.HasExited) { throw 'GUI exited during startup' }
-          if ($process.MainWindowHandle -eq 0) { throw 'GUI window was not created' }
-          Stop-Process -Id $process.Id
+          $deadline = (Get-Date).AddSeconds(45)
+          $windows = @()
+          do {
+            Start-Sleep -Seconds 1
+            $process.Refresh()
+            if ($process.HasExited) { throw 'GUI exited during startup' }
+            # PyInstaller onefile creates a child process that owns the window.
+            $windows = @(Get-Process -Name 'XSF-to-SF2' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+          } while ($windows.Count -eq 0 -and (Get-Date) -lt $deadline)
+          if ($windows.Count -eq 0) { throw 'GUI window was not created' }
+          Get-Process -Name 'XSF-to-SF2' -ErrorAction SilentlyContinue | Stop-Process
       - name: Package download
         shell: pwsh
         run: |
