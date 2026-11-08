@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import json
+import io
+import struct
 import os
 from pathlib import Path
 import tempfile
@@ -20,6 +22,34 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(),plain)
         self.assertEqual(result.sha256,hashlib.sha256(plain).hexdigest())
         self.assertEqual((result.info.presets,result.info.instruments,result.info.samples),(1,1,1))
+    def test_detects_variable_soundfont_offsets(self):
+        plain=soundfont(100000)
+        for extra in (0,16,24,29,160):
+            with self.subTest(extra=extra):
+                data=encrypted(plain,prefix=bytes((i*37+5)%256 for i in range(extra)))
+                source=self.folder/f'offset-{extra}.xsf';source.write_bytes(data)
+                key,info,offset=core.find_key(io.BytesIO(data),len(data))
+                self.assertEqual(offset,core.HEADER_SIZE+extra)
+                self.assertEqual(info.size,len(plain))
+                self.assertEqual(core.xor(data[offset:],key),plain)
+                target=self.folder/f'offset-{extra}.sf2'
+                result=core.convert(source,target)
+                self.assertEqual(target.read_bytes(),plain)
+                self.assertEqual(result.sha256,hashlib.sha256(plain).hexdigest())
+    def test_ignores_false_riff_signature_in_metadata(self):
+        plain=soundfont(100000)
+        prefix=b'RIFF'+struct.pack('<I',len(plain)+32-8)+b'sfbkLIST'+bytes(16)
+        data=encrypted(plain,prefix=prefix)
+        key,info,offset=core.find_key(io.BytesIO(data),len(data))
+        self.assertEqual(offset,core.HEADER_SIZE+32)
+        self.assertEqual(core.xor(data[offset:],key),plain)
+    def test_shifted_header_across_stream_boundary(self):
+        plain=soundfont(core.BLOCK_SIZE+550)
+        source=self.folder/'shifted-large.xsf'
+        source.write_bytes(encrypted(plain,prefix=bytes(range(24))))
+        target=self.folder/'shifted-large.sf2'
+        core.convert(source,target)
+        self.assertEqual(target.read_bytes(),plain)
     def test_second_key(self):
         data=soundfont(100000);source=self.folder/'other.xsf'
         source.write_bytes(encrypted(data,bytes(range(128))))

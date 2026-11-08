@@ -21,6 +21,7 @@ HEADER_SIZE = 1116
 KEY_SIZE = 128
 BLOCK_SIZE = 8 * 1024 * 1024
 MAX_SF2 = 0xFFFFFFFF + 8
+HEADER_PROBE_SIZE = 2048
 
 class ConversionError(Exception):
     pass
@@ -75,12 +76,14 @@ class ConversionResult:
     info: SoundFontInfo
 
 class Reader:
-    def __init__(self, file: BinaryIO, size: int, key: bytes | None = None):
+    def __init__(self, file: BinaryIO, size: int, key: bytes | None = None,
+                 source_offset: int = HEADER_SIZE):
         self.file, self.size, self.key = file, size, key
+        self.source_offset = source_offset
     def read(self, offset: int, count: int) -> bytes:
         if offset < 0 or count < 0 or offset + count > self.size:
             raise ConversionError("ขนาดข้อมูลอยู่นอกไฟล์ SF2")
-        value = exact(self.file, offset + (HEADER_SIZE if self.key else 0), count)
+        value = exact(self.file, offset + (self.source_offset if self.key else 0), count)
         return xor(value, self.key, offset) if self.key else value
 
 def validate(reader: Reader, cancel: Callable[[], bool] = lambda: False) -> SoundFontInfo:
@@ -133,12 +136,15 @@ def validate(reader: Reader, cancel: Callable[[], bool] = lambda: False) -> Soun
                          pd[4][2] // 22 - 1, pd[8][2] // 46 - 1)
 
 def find_key(file: BinaryIO, size: int, cancel: Callable[[], bool] = lambda: False,
-             status: Callable[[str], None] = lambda _: None) -> tuple[bytes, SoundFontInfo]:
+             status: Callable[[str], None] = lambda _: None) -> tuple[bytes, SoundFontInfo, int]:
     if size < HEADER_SIZE + KEY_SIZE or exact(file, 0, 8) != b"XSTM\x01\0\0\0":
-        raise ConversionError("รองรับเฉพาะ XSTM รุ่น 1 แบบส่วนหัว 1,116 ไบต์")
+        raise ConversionError("รองรับเฉพาะ XSTM รุ่น 1 แบบที่วิเคราะห์แล้ว")
     payload = size - HEADER_SIZE
-    if payload > MAX_SF2:
+    if payload > MAX_SF2 + HEADER_PROBE_SIZE:
         raise ConversionError("เกินขนาดของ RIFF/SF2 แบบ 32 บิต (ประมาณ 4 GiB)")
+    # Newer containers place extra metadata before RIFF. Keep the inference
+    # origin fixed, then rotate the key when the actual payload start is found.
+    probe = exact(file, HEADER_SIZE, min(HEADER_PROBE_SIZE, payload))
     for window in (100000, 65536, 1048576, 4194304):
         check(cancel)
         status(f"กำลังหาคีย์จากข้อมูลท้ายไฟล์ {min(window, payload):,} ไบต์…")
@@ -146,22 +152,39 @@ def find_key(file: BinaryIO, size: int, cancel: Callable[[], bool] = lambda: Fal
         tail = exact(file, HEADER_SIZE + start, payload - start)
         key = bytes(Counter(tail[(i - start) % KEY_SIZE::KEY_SIZE]).most_common(1)[0][0]
                     for i in range(KEY_SIZE))
-        candidates = [key]
-        anchored = bytearray(key)
-        known = b"RIFF" + struct.pack("<I", payload - 8) + b"sfbkLIST"
-        cipher = exact(file, HEADER_SIZE, 24)
-        anchored[:16] = bytes(a ^ b for a, b in zip(cipher[:16], known))
-        anchored[20:24] = bytes(a ^ b for a, b in zip(cipher[20:24], b"INFO"))
-        candidates.append(bytes(anchored))
-        for candidate in candidates:
-            try:
-                return candidate, validate(Reader(file, payload, candidate), cancel)
-            except Cancelled:
-                raise
-            except ConversionError:
-                pass
-    raise ConversionError("หาคีย์ที่ตรวจโครงสร้างผ่านไม่ได้ ไฟล์อาจเป็น XSF คนละรูปแบบ "
-                          "กรุณาส่งออกข้อมูลวิเคราะห์ ไม่ใช่เพิ่ม RAM หรือ GPU เพียงอย่างเดียว")
+        decoded = xor(probe, key)
+        positions = []
+        at = decoded.find(b"RIFF")
+        while at >= 0:
+            if (at + 24 <= len(decoded) and decoded[at+8:at+12] == b"sfbk"
+                    and struct.unpack_from("<I", decoded, at+4)[0] + 8 == payload - at):
+                positions.append(at)
+            at = decoded.find(b"RIFF", at + 1)
+        # Known header variants also allow recovery when a statistical key
+        # guess is wrong in the RIFF/INFO header. Every candidate is validated.
+        for skip in dict.fromkeys(positions + [0, 16, 24]):
+            check(cancel)
+            length = payload - skip
+            if length < 24 or length > MAX_SF2 or skip + 24 > len(probe):
+                continue
+            phase = skip % KEY_SIZE
+            rotated = key[phase:] + key[:phase]
+            anchored = bytearray(rotated)
+            known = b"RIFF" + struct.pack("<I", length - 8) + b"sfbkLIST"
+            cipher = probe[skip:skip+24]
+            anchored[:16] = bytes(a ^ b for a, b in zip(cipher[:16], known))
+            anchored[20:24] = bytes(a ^ b for a, b in zip(cipher[20:24], b"INFO"))
+            for candidate in (rotated, bytes(anchored)):
+                try:
+                    source_offset = HEADER_SIZE + skip
+                    info = validate(Reader(file, length, candidate, source_offset), cancel)
+                    return candidate, info, source_offset
+                except Cancelled:
+                    raise
+                except ConversionError:
+                    pass
+    raise ConversionError("หาคีย์หรือจุดเริ่ม SF2 ที่ตรวจโครงสร้างผ่านไม่ได้ "
+                          "กรุณาส่งออกข้อมูลวิเคราะห์เพื่อตรวจรูปแบบเพิ่มเติม")
 
 def convert(source: Path | str, destination: Path | str, *, overwrite: bool = False,
             cancel: Callable[[], bool] = lambda: False,
@@ -176,11 +199,11 @@ def convert(source: Path | str, destination: Path | str, *, overwrite: bool = Fa
     try:
         with source.open("rb") as file:
             before = os.fstat(file.fileno())
-            key, info = find_key(file, before.st_size, cancel, status)
+            key, info, source_offset = find_key(file, before.st_size, cancel, status)
             digest = hashlib.sha256()
             with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".xsf-", suffix=".tmp", delete=False) as output:
                 temporary = Path(output.name)
-                file.seek(HEADER_SIZE)
+                file.seek(source_offset)
                 offset = 0
                 while offset < info.size:
                     check(cancel)

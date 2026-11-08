@@ -22,9 +22,9 @@ def soundfont(audio_size=8192):
         (b'imod',b'\0'*10),(b'igen',struct.pack('<HHHH',53,0,0,0)),(b'shdr',shdr)]))
     return chunk(b'RIFF',b'sfbk'+info+sdta+pdta)
 
-def encrypted(data, key=None):
+def encrypted(data, key=None, prefix=b''):
     key=key or bytes((i*73+19)%256 for i in range(128))
-    return b'XSTM\x01\0\0\0'+b'\0'*(HEADER_SIZE-8)+xor(data,key)
+    return b'XSTM\x01\0\0\0'+b'\0'*(HEADER_SIZE-8)+xor(prefix+data,key)
 
 def write_pair(folder, audio_size=8192):
     original=soundfont(audio_size)

@@ -45,6 +45,10 @@ jobs:
           & dist/XSF-to-SF2-CLI.exe --cli test.xsf packaged.sf2
           if ($LASTEXITCODE -ne 0) { throw 'Packaged converter failed' }
           python -c "from pathlib import Path; from tests.fixtures import soundfont; assert Path('packaged.sf2').read_bytes() == soundfont()"
+          python -c "from pathlib import Path; from tests.fixtures import encrypted, soundfont; Path('shifted.xsf').write_bytes(encrypted(soundfont(), prefix=bytes(range(24))))"
+          & dist/XSF-to-SF2-CLI.exe --cli shifted.xsf shifted.sf2
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged shifted-header converter failed' }
+          python -c "from pathlib import Path; from tests.fixtures import soundfont; assert Path('shifted.sf2').read_bytes() == soundfont()"
           $process = Start-Process -FilePath 'dist/XSF-to-SF2.exe' -PassThru
           $deadline = (Get-Date).AddSeconds(45)
           $windows = @()
